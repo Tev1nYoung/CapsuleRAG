@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Tuple
 
-from ..config import StructAlignLiteConfig
+from ..config import CapsuleBridgeConfig
 from ..utils.text_utils import clean_wiki_text, split_sentences
 
 
@@ -20,7 +20,7 @@ def _count_words(text: str) -> int:
 
 def split_corpus_to_docs_and_passages(
     corpus: List[Dict[str, Any]],
-    config: StructAlignLiteConfig,
+    config: CapsuleBridgeConfig,
     tokenizer,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """

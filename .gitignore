@@ -10,6 +10,25 @@ __pycache__/
 # Local secrets
 llm_key.txt
 
+# Local presentation / interview materials
+*.ppt
+*.pptx
+~$*.pptx
+*.doc
+*.docx
+*.pdf
+*.png
+*.jpg
+*.jpeg
+
+# Local notes / generated assets
+docs/
+analysis/
+figures/
+tmp/
+tools/
+reproduce/
+
 # Outputs / logs / reports
 outputs/
 outputs*/
@@ -25,4 +44,3 @@ reports/
 # Editors
 .vscode/
 .idea/
-

@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
-from ..config import StructAlignLiteConfig
+from ..config import CapsuleBridgeConfig
 from ..utils.logging_utils import get_logger
 from ..utils.text_utils import extract_entity_mentions, normalize_entity
 from ..utils.genericness_utils import title_genericness_score
@@ -151,7 +151,7 @@ class RetrievalResult:
 
 
 class StructAlignRetriever:
-    def __init__(self, config: StructAlignLiteConfig) -> None:
+    def __init__(self, config: CapsuleBridgeConfig) -> None:
         self.config = config
 
     def retrieve(
@@ -401,7 +401,7 @@ class StructAlignRetriever:
                             g["candidates"] = sorted(g.get("candidates") or [], key=lambda x: float(x.get("prize") or 0.0), reverse=True)
                             group_prize_maps[gid] = pm
         except Exception as e:
-            logger.debug(f"[StructAlignLiteRAG] [PPR] skipped | err={type(e).__name__}: {e}")
+            logger.debug(f"[CapsuleBridgeRAG] [PPR] skipped | err={type(e).__name__}: {e}")
 
         # DAG-aware binding assignment (zero-shot variable binding via entity overlap).
         parents = _build_parent_map(query_dag, set(node_ids))
@@ -543,7 +543,7 @@ class StructAlignRetriever:
                             continue
                         doc_score[didx] = float(doc_score.get(didx, 0.0)) + ppr_doc_w * float(rrf)
         except Exception as e:
-            logger.debug(f"[StructAlignLiteRAG] [PPR] doc boost skipped | err={type(e).__name__}: {e}")
+            logger.debug(f"[CapsuleBridgeRAG] [PPR] doc boost skipped | err={type(e).__name__}: {e}")
 
         # Entity-jump: if an entity mentioned in high-prize capsules matches a doc title in the corpus,
         # boost that doc. This is a cheap zero-shot way to recover second-hop pages.
@@ -700,10 +700,10 @@ class StructAlignRetriever:
                     rest = [int(d) for d in struct_docs_rank if int(d) not in seen]
                     struct_docs_rank = sel_docs + rest
                     logger.debug(
-                        f"[StructAlignLiteRAG] [ONLINE_RERANK] applied | top_n={top_n} selected={sel_docs} cache_hit={bool((meta or {}).get('cache_hit'))}"
+                        f"[CapsuleBridgeRAG] [ONLINE_RERANK] applied | top_n={top_n} selected={sel_docs} cache_hit={bool((meta or {}).get('cache_hit'))}"
                     )
             except Exception as e:
-                logger.debug(f"[StructAlignLiteRAG] [ONLINE_RERANK] skipped | err={type(e).__name__}: {e}")
+                logger.debug(f"[CapsuleBridgeRAG] [ONLINE_RERANK] skipped | err={type(e).__name__}: {e}")
 
         # Build retrieved_docs list: struct-selected first, then dense fill.
         retrieved_docs: List[str] = []

@@ -9,7 +9,7 @@ DEFAULT_EMB_NAME = "facebook/contriever"
 
 
 @dataclass
-class StructAlignLiteConfig:
+class CapsuleBridgeConfig:
     # I/O
     dataset: str = "sample"
     save_root: str = "outputs"
@@ -149,3 +149,6 @@ class StructAlignLiteConfig:
     def save_dir(self) -> str:
         # Keep the same "outputs/<dataset>" style
         return os.path.join(self.save_root, self.dataset)
+
+
+StructAlignLiteConfig = CapsuleBridgeConfig
