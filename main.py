@@ -2,16 +2,16 @@ import argparse
 import os
 import time
 
-from src.capsulebridge.config import DEFAULT_EMB_NAME, DEFAULT_LLM_BASE_URL, DEFAULT_LLM_NAME, CapsuleBridgeConfig
-from src.capsulebridge.data.dataset_loader import (
+from src.capsulerag.config import DEFAULT_EMB_NAME, DEFAULT_LLM_BASE_URL, DEFAULT_LLM_NAME, CapsuleRAGConfig
+from src.capsulerag.data.dataset_loader import (
     cap_samples,
     get_gold_answers,
     get_gold_docs,
     load_corpus,
     load_samples,
 )
-from src.capsulebridge.structalignrag import CapsuleBridgeRAG
-from src.capsulebridge.utils.logging_utils import setup_logging
+from src.capsulerag.capsulerag import CapsuleRAG
+from src.capsulerag.utils.logging_utils import setup_logging
 
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -23,7 +23,7 @@ def _parse_bool(x: str) -> bool:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="CapsuleBridgeRAG (lite_a only) retrieval and QA")
+    parser = argparse.ArgumentParser(description="CapsuleRAG (lite_a only) retrieval and QA")
     parser.add_argument("--dataset", type=str, default="sample", help="Dataset name (reproduce/dataset/*.json)")
     parser.add_argument(
         "--run_mode",
@@ -104,7 +104,7 @@ def main() -> None:
 
     run_tag = args.run_tag or f"smoke_{run_mode}"
 
-    cfg = CapsuleBridgeConfig(
+    cfg = CapsuleRAGConfig(
         dataset=dataset,
         save_root=args.save_root,
         run_tag=run_tag,
@@ -130,7 +130,7 @@ def main() -> None:
         cfg.embedding_query_instruction = str(args.embedding_query_instruction)
 
     t0 = time.time()
-    rag = CapsuleBridgeRAG(cfg)
+    rag = CapsuleRAG(cfg)
     t_init = time.time() - t0
 
     t1 = time.time()

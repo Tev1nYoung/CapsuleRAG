@@ -91,8 +91,8 @@ The current codebase is a streamlined implementation centered on:
 Important scope notes:
 
 - the public-facing project name is **CapsuleRAG**
-- the Python package name is still `src/capsulebridge`
-- some internal class names still use the historical name `CapsuleBridgeRAG`
+- the Python package name is now `src/capsulerag`
+- the main runtime classes are now aligned to `CapsuleRAG`
 - bridge-style cross-document behavior still exists, but not as a standalone headline module
 
 ## Repository layout
@@ -101,27 +101,27 @@ The main code you likely care about is:
 
 ```text
 main.py                                  CLI entrypoint
-src/capsulebridge/config.py              runtime configuration
-src/capsulebridge/structalignrag.py      main pipeline orchestration
-src/capsulebridge/data/                  dataset loading helpers
-src/capsulebridge/embed/                 embedding backbones
-src/capsulebridge/offline/               indexing / extraction / graph building
-src/capsulebridge/online/                query DAG / retrieval / propagation / generation
-src/capsulebridge/metrics/               retrieval and QA metrics
-src/capsulebridge/utils/                 shared utilities
+src/capsulerag/config.py                 runtime configuration
+src/capsulerag/capsulerag.py             main pipeline orchestration
+src/capsulerag/data/                     dataset loading helpers
+src/capsulerag/embed/                    embedding backbones
+src/capsulerag/offline/                  indexing / extraction / graph building
+src/capsulerag/online/                   query DAG / retrieval / propagation / generation
+src/capsulerag/metrics/                  retrieval and QA metrics
+src/capsulerag/utils/                    shared utilities
 ```
 
 Key files:
 
-- `src/capsulebridge/offline/passage_splitter.py`
-- `src/capsulebridge/offline/capsule_extractor.py`
-- `src/capsulebridge/offline/entity_canonicalizer.py`
-- `src/capsulebridge/offline/capsule_canonicalizer.py`
-- `src/capsulebridge/offline/graph_builder.py`
-- `src/capsulebridge/online/query_dag.py`
-- `src/capsulebridge/online/retriever.py`
-- `src/capsulebridge/online/propagation.py`
-- `src/capsulebridge/online/generator.py`
+- `src/capsulerag/offline/passage_splitter.py`
+- `src/capsulerag/offline/capsule_extractor.py`
+- `src/capsulerag/offline/entity_canonicalizer.py`
+- `src/capsulerag/offline/capsule_canonicalizer.py`
+- `src/capsulerag/offline/graph_builder.py`
+- `src/capsulerag/online/query_dag.py`
+- `src/capsulerag/online/retriever.py`
+- `src/capsulerag/online/propagation.py`
+- `src/capsulerag/online/generator.py`
 
 ## Minimal runtime setup
 
@@ -180,7 +180,7 @@ Expected high-level shapes:
 
 The loading logic lives in:
 
-- `src/capsulebridge/data/dataset_loader.py`
+- `src/capsulerag/data/dataset_loader.py`
 
 ## What is intentionally not tracked here
 
@@ -203,10 +203,10 @@ If another agent needs the shortest possible orientation:
 - the main novelty is **structured evidence capsules**
 - retrieval is improved by **Query DAG decomposition** and **local mini-PPR**
 - the public project name is **CapsuleRAG**
-- the current Python package path is still **`src/capsulebridge`**
+- the current Python package path is **`src/capsulerag`**
 - the main entrypoint is **`main.py`**
-- the main orchestrator is **`src/capsulebridge/structalignrag.py`**
-- the most important online logic is in **`src/capsulebridge/online/retriever.py`**
+- the main orchestrator is **`src/capsulerag/capsulerag.py`**
+- the most important online logic is in **`src/capsulerag/online/retriever.py`**
 
 ## Current limitations
 
@@ -219,12 +219,10 @@ The present implementation still has clear limits:
 
 ## Naming note
 
-For presentation and discussion, use **CapsuleRAG**.
+Use **CapsuleRAG** consistently for the project, package path, and main runtime class.
 
-Internally, some code still keeps the historical names:
+Current aligned names:
 
-- package: `capsulebridge`
-- config class: `CapsuleBridgeConfig`
-- main class: `CapsuleBridgeRAG`
-
-That mismatch is historical, not conceptual.
+- package: `capsulerag`
+- config class: `CapsuleRAGConfig`
+- main class: `CapsuleRAG`

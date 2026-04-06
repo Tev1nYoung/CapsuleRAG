@@ -22,7 +22,7 @@ TextChatMessage = Dict[str, Any]
 
 
 def _project_root_key_path() -> str:
-    # .../src/structalignrag/llm/openai_compat.py -> project root
+# .../src/capsulerag/llm/openai_compat.py -> project root
     return os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "llm_key.txt"))
 
 

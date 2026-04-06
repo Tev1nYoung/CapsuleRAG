@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Tuple
 
-from ..config import CapsuleBridgeConfig
+from ..config import CapsuleRAGConfig
 from ..utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -33,7 +33,7 @@ def minimal_extract(raw: str) -> str:
 
 
 class AnswerGenerator:
-    def __init__(self, config: CapsuleBridgeConfig, llm) -> None:
+    def __init__(self, config: CapsuleRAGConfig, llm) -> None:
         self.config = config
         self.llm = llm
 
@@ -79,7 +79,7 @@ class AnswerGenerator:
                 seed=self.config.seed,
             )
         except Exception as e:
-            logger.warning(f"[CapsuleBridgeRAG] [GEN_FINAL] LLM infer failed | err={type(e).__name__}: {e}")
+            logger.warning(f"[CapsuleRAG] [GEN_FINAL] LLM infer failed | err={type(e).__name__}: {e}")
             raw, meta = "", {"error": f"{type(e).__name__}: {e}"}
 
         ans = minimal_extract(raw or "")
