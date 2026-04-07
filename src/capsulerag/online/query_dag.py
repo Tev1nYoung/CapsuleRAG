@@ -100,6 +100,61 @@ def _single_node_dag(question: str) -> Dict[str, Any]:
     }
 
 
+def _estimate_min_nodes(question: str, config: CapsuleRAGConfig) -> int:
+    """
+    Heuristic lower bound for decomposition depth.
+
+    Musique-style hard questions often contain multiple nested relative clauses
+    ("where ... who ... that ..."), and the LLM tends to collapse several hops
+    into one node unless we ask for a finer-grained DAG.
+    """
+    q = str(question or "").lower()
+    rel_hits = len(re.findall(r"\b(where|who|whose|which|that|when)\b", q))
+    temporal_hits = len(re.findall(r"\b(after|before|during|while)\b", q))
+    coord_hits = len(re.findall(r"\band\b", q))
+    wh_hits = len(re.findall(r"\b(what|which|who|when|where|how)\b", q))
+
+    target = 2 + min(rel_hits, 3)
+    if temporal_hits:
+        target += 1
+    if coord_hits >= 2:
+        target += 1
+    if wh_hits >= 3 and rel_hits >= 2:
+        target += 1
+    return max(3, min(int(config.query_dag_max_nodes), target))
+
+
+def _normalize_dag(question: str, dag: Dict[str, Any], config: CapsuleRAGConfig, meta: Any = None) -> Dict[str, Any]:
+    nodes = dag.get("nodes") or []
+    if not isinstance(nodes, list) or not nodes:
+        raise ValueError("DAG nodes missing")
+
+    norm_nodes = []
+    for idx, n in enumerate(nodes[: config.query_dag_max_nodes]):
+        nid = n.get("id") or f"q{idx}"
+        nq = n.get("question") or question
+        norm_nodes.append(
+            {
+                "id": str(nid),
+                "question": str(nq),
+                "depends_on": list(n.get("depends_on") or []),
+                "operator": str(n.get("operator") or "other"),
+                "vars_in": list(n.get("vars_in") or []),
+                "vars_out": list(n.get("vars_out") or []),
+                "constraints": dict(n.get("constraints") or {}),
+            }
+        )
+
+    edges = dag.get("edges") or []
+    if not isinstance(edges, list):
+        edges = []
+
+    out = {"question": question, "nodes": norm_nodes, "edges": edges}
+    if meta is not None:
+        out["_llm_meta"] = meta
+    return out
+
+
 def _lines_to_chain_dag(question: str, lines: List[str], max_nodes: int) -> Dict[str, Any]:
     # Build a simple chain DAG q0 -> q1 -> q2 -> ...
     subqs = []
@@ -141,6 +196,7 @@ def build_query_dag(question: str, llm, config: CapsuleRAGConfig) -> Dict[str, A
     if not config.enable_query_dag:
         return _single_node_dag(question)
 
+    min_nodes = _estimate_min_nodes(question, config) if bool(getattr(config, "query_dag_enforce_min_nodes", False)) else 3
     system = (
         "You decompose a multi-hop question into a dependency DAG of retrieval-ready sub-questions. "
         "Your output will be used for dense retrieval embeddings, so ambiguity hurts performance. "
@@ -152,7 +208,8 @@ def build_query_dag(question: str, llm, config: CapsuleRAGConfig) -> Dict[str, A
         "Return JSON with keys: nodes, edges.\n"
         "Each node: {id, question, depends_on, operator, vars_in, vars_out, constraints}.\n"
         "Rules:\n"
-        f"- Keep 3-{config.query_dag_max_nodes} nodes if possible.\n"
+        f"- Keep {min_nodes}-{config.query_dag_max_nodes} nodes if possible.\n"
+        "- Prefer one atomic retrieval hop per node; do not merge multiple bridge steps into one node.\n"
         "- Every node.question MUST be a fully-specified, standalone question.\n"
         "- Do NOT use pronouns (he/she/it/they) and do NOT use placeholders like {location}, {symbol}, 'that place', 'the symbol'.\n"
         "- If needed, repeat entity names from the original question so each node.question is directly searchable.\n"
@@ -176,71 +233,32 @@ def build_query_dag(question: str, llm, config: CapsuleRAGConfig) -> Dict[str, A
     try:
         raw, meta = _llm_json(messages)
         dag = _extract_json_object(raw)
-        nodes = dag.get("nodes") or []
-        if not isinstance(nodes, list) or not nodes:
-            raise ValueError("DAG nodes missing")
-
-        # Normalize and cap.
-        norm_nodes = []
-        for idx, n in enumerate(nodes[: config.query_dag_max_nodes]):
-            nid = n.get("id") or f"q{idx}"
-            nq = n.get("question") or question
-            norm_nodes.append(
-                {
-                    "id": str(nid),
-                    "question": str(nq),
-                    "depends_on": list(n.get("depends_on") or []),
-                    "operator": str(n.get("operator") or "other"),
-                    "vars_in": list(n.get("vars_in") or []),
-                    "vars_out": list(n.get("vars_out") or []),
-                    "constraints": dict(n.get("constraints") or {}),
-                }
-            )
-
-        edges = dag.get("edges") or []
-        if not isinstance(edges, list):
-            edges = []
-
-        out = {"question": question, "nodes": norm_nodes, "edges": edges}
-        out["_llm_meta"] = meta
-        return out
+        out = _normalize_dag(question=question, dag=dag, config=config, meta=meta)
+        if len(out.get("nodes") or []) >= min_nodes or min_nodes <= 3:
+            return out
+        raise ValueError(f"under_decomposed:{len(out.get('nodes') or [])}<{min_nodes}")
     except Exception as e:
-        # Second attempt: a stricter, shorter prompt often reduces formatting errors.
+        # Second attempt: if the first DAG is too shallow or malformed, force a finer-grained expansion.
         try:
-            system2 = "Return a valid JSON object only. Do not include any extra text."
+            system2 = (
+                "Return a valid JSON object only. Do not include any extra text. "
+                "Decompose the question into finer-grained retrieval hops."
+            )
             user2 = (
                 f"Question:\n{question}\n\n"
                 "Return JSON with keys: nodes, edges.\n"
                 "nodes is a list of objects {id, question, depends_on, operator, vars_in, vars_out, constraints}.\n"
                 "edges is a list.\n"
+                f"Use at least {min_nodes} nodes and at most {config.query_dag_max_nodes} nodes if possible.\n"
+                "Do not merge multiple bridge relations into one node.\n"
+                "Each node.question should resolve exactly one retrieval step and remain standalone.\n"
                 "Use double quotes for all strings.\n"
                 "Do not output markdown."
             )
             raw2, meta2 = _llm_json([{"role": "system", "content": system2}, {"role": "user", "content": user2}])
             dag2 = _extract_json_object(raw2)
-            nodes2 = dag2.get("nodes") or []
-            if isinstance(nodes2, list) and nodes2:
-                # Normalize to our internal schema.
-                norm_nodes = []
-                for idx, n in enumerate(nodes2[: config.query_dag_max_nodes]):
-                    nid = n.get("id") or f"q{idx}"
-                    nq = n.get("question") or question
-                    norm_nodes.append(
-                        {
-                            "id": str(nid),
-                            "question": str(nq),
-                            "depends_on": list(n.get("depends_on") or []),
-                            "operator": str(n.get("operator") or "other"),
-                            "vars_in": list(n.get("vars_in") or []),
-                            "vars_out": list(n.get("vars_out") or []),
-                            "constraints": dict(n.get("constraints") or {}),
-                        }
-                    )
-                edges2 = dag2.get("edges") or []
-                if not isinstance(edges2, list):
-                    edges2 = []
-                out2 = {"question": question, "nodes": norm_nodes, "edges": edges2}
-                out2["_llm_meta"] = meta2
+            out2 = _normalize_dag(question=question, dag=dag2, config=config, meta=meta2)
+            if len(out2.get("nodes") or []) >= max(2, min_nodes - 1):
                 return out2
         except Exception:
             pass
@@ -249,12 +267,13 @@ def build_query_dag(question: str, llm, config: CapsuleRAGConfig) -> Dict[str, A
         try:
             system3 = (
                 "Decompose the question into short, standalone sub-questions. "
-                "Output one sub-question per line. No numbering, no bullets, no extra text."
+                "Output one sub-question per line. No numbering, no bullets, no extra text. "
+                "Do not merge multiple bridge hops into one line."
             )
-            user3 = f"Question:\n{question}\n\nReturn between 3 and {config.query_dag_max_nodes} lines."
+            user3 = f"Question:\n{question}\n\nReturn between {min_nodes} and {config.query_dag_max_nodes} lines."
             raw3, _meta3 = llm.infer(messages=[{"role": "system", "content": system3}, {"role": "user", "content": user3}])
             lines = [ln.strip() for ln in str(raw3 or "").splitlines() if ln.strip()]
-            if len(lines) >= 2:
+            if len(lines) >= max(2, min_nodes - 1):
                 return _lines_to_chain_dag(question, lines, config.query_dag_max_nodes)
         except Exception:
             pass

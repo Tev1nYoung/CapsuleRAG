@@ -63,7 +63,18 @@ def main() -> None:
 
     # Parallelism
     parser.add_argument("--offline_llm_workers", type=int, default=16, help="Offline LLM parallel workers")
-    parser.add_argument("--online_qa_workers", type=int, default=8, help="Online QA parallel workers (per-query)")
+    parser.add_argument(
+        "--online_qa_workers",
+        type=int,
+        default=0,
+        help="Online QA parallel workers (per-query). 0 means auto.",
+    )
+    parser.add_argument(
+        "--llm_max_parallel_requests",
+        type=int,
+        default=None,
+        help="Optional cap on concurrent uncached LLM requests. Helps avoid rate limits / malformed outputs.",
+    )
 
     # Optional quick checks
     parser.add_argument("--max_queries", type=int, default=None, help="Optional cap on number of queries")
@@ -113,7 +124,7 @@ def main() -> None:
         embedding_model_name=args.embedding_name,
         force_index_from_scratch=_parse_bool(args.force_index_from_scratch),
         offline_llm_workers=int(args.offline_llm_workers or 16),
-        online_qa_workers=int(args.online_qa_workers or 8),
+        online_qa_workers=int(args.online_qa_workers or 0),
     )
 
     if args.embedding_batch_size is not None:
@@ -128,6 +139,8 @@ def main() -> None:
         cfg.embedding_dtype = str(args.embedding_dtype)
     if args.embedding_query_instruction is not None:
         cfg.embedding_query_instruction = str(args.embedding_query_instruction)
+    if args.llm_max_parallel_requests is not None:
+        cfg.llm_max_parallel_requests = int(args.llm_max_parallel_requests)
 
     t0 = time.time()
     rag = CapsuleRAG(cfg)

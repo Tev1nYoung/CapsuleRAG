@@ -20,6 +20,8 @@ class CapsuleRAGConfig:
     llm_base_url: str = DEFAULT_LLM_BASE_URL
     llm_name: str = DEFAULT_LLM_NAME
     embedding_model_name: str = DEFAULT_EMB_NAME
+    llm_max_parallel_requests: int = 2  # cap concurrent uncached LLM calls to reduce 429/format failures
+    llm_max_retries: int = 6
 
     # Embedding runtime
     embedding_batch_size: int = 16
@@ -40,7 +42,7 @@ class CapsuleRAGConfig:
     offline_llm_workers: int = 16
     # Online QA: parallelize across queries (safe; does not change ranking/logic).
     # 0 means "auto" (pick a conservative default based on available API keys).
-    online_qa_workers: int = 8
+    online_qa_workers: int = 0
 
     # Canonicalization
     enable_entity_canonicalization: bool = True
@@ -56,6 +58,7 @@ class CapsuleRAGConfig:
     # Online: query decomposition
     enable_query_dag: bool = True
     query_dag_max_nodes: int = 7
+    query_dag_enforce_min_nodes: bool = False
 
     # Online: candidate generation
     subq_top_capsule: int = 50
@@ -109,12 +112,28 @@ class CapsuleRAGConfig:
     llm_doc_rerank_top_n: int = 10  # rerank inside the first N docs from structural rank
     llm_doc_rerank_select_k: int = 2  # how many docs to place at the top
     llm_doc_rerank_snippet_chars: int = 320  # per-candidate snippet budget
+    enable_adaptive_llm_doc_rerank: bool = True
+    adaptive_llm_doc_rerank_max_select_k: int = 4
+    adaptive_llm_doc_rerank_top_n_step: int = 2
+    adaptive_llm_doc_rerank_max_top_n: int = 16
+    enable_group_seeded_rerank_pool: bool = False
+    group_seeded_rerank_search_n: int = 60
+    group_seeded_rerank_docs_per_group: int = 1
+    group_seeded_rerank_min_rel: float = 0.85
+    enable_group_doc_coverage: bool = False
+    group_doc_coverage_top_n: int = 40  # search this many ranked docs when front-loading docs/passages for uncovered subQs
+    group_doc_coverage_min_rel: float = 0.85  # only count a doc for a subQ if it is near the group's best doc score
 
     # Retrieval output
     retrieval_top_k: int = 200  # used for recall@k list
     qa_top_k_passages: int = 5  # number of passages fed to LLM (match HippoRAG default)
     qa_ensure_top_docs: int = 2  # ensure evidence includes at least this many top-ranked docs (if available)
     passage_token_budget: int = 1800
+    enable_adaptive_qa_evidence: bool = False
+    adaptive_qa_top_k_passages_max: int = 8
+    adaptive_qa_ensure_top_docs_max: int = 3
+    adaptive_qa_token_budget_step: int = 250
+    adaptive_qa_token_budget_max: int = 2600
     subq_coverage_top_m: int = 5
 
     # GCP parameters
@@ -133,6 +152,7 @@ class CapsuleRAGConfig:
     temperature: float = 0.0
     max_new_tokens: int = 256
     seed: Optional[int] = None
+    json_generator_min_qdag_nodes: int = 3
 
     # Offline LLM extraction/NLI (separate budget)
     offline_temperature: float = 0.0

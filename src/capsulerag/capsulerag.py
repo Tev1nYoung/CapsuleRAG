@@ -134,7 +134,11 @@ class CapsuleRAG:
             temperature=config.temperature,
             max_new_tokens=config.max_new_tokens,
             seed=config.seed,
-            max_retries=2,
+            max_retries=int(getattr(config, "llm_max_retries", 6) or 6),
+            max_parallel_requests=int(getattr(config, "llm_max_parallel_requests", 0) or 0),
+        )
+        logger.info(
+            f"[CapsuleRAG] llm runtime | keys={getattr(self.llm, 'num_keys')()} max_parallel_requests={int(getattr(config, 'llm_max_parallel_requests', 0) or 0)}"
         )
 
         # Pipeline parts
@@ -278,7 +282,7 @@ class CapsuleRAG:
 
             dag = build_query_dag(q, llm=self.llm, config=self.config)
             rr = self.retriever.retrieve(question=q, query_dag=dag, index=index, embedder=self.embedder, llm=self.llm)
-            ans, gen_meta = self.generator.answer(question=q, passages=rr.selected_passages)
+            ans, gen_meta = self.generator.answer(question=q, passages=rr.selected_passages, query_dag=dag)
 
             return {
                 "i": i,
