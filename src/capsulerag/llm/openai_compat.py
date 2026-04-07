@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -12,7 +13,7 @@ import openai
 from filelock import FileLock
 from openai import AzureOpenAI, OpenAI
 from packaging import version
-from tenacity import retry, stop_after_attempt, wait_fixed
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 from ..utils.logging_utils import get_logger
 
@@ -22,7 +23,7 @@ TextChatMessage = Dict[str, Any]
 
 
 def _project_root_key_path() -> str:
-    # .../src/structalignrag/llm/openai_compat.py -> project root
+# .../src/capsulerag/llm/openai_compat.py -> project root
     return os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "llm_key.txt"))
 
 
@@ -160,7 +161,11 @@ def dynamic_retry_decorator(func):
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
         max_retries = getattr(self, "max_retries", 2)
-        decorated = retry(stop=stop_after_attempt(max_retries), wait=wait_fixed(1))(func)
+        decorated = retry(
+            stop=stop_after_attempt(max_retries),
+            wait=wait_exponential(multiplier=1, min=1, max=20),
+            reraise=True,
+        )(func)
         return decorated(self, *args, **kwargs)
 
     return wrapper
@@ -185,10 +190,12 @@ class CacheOpenAICompat:
         high_throughput: bool = True,
         azure_endpoint: Optional[str] = None,
         timeout_s: float = 120.0,
+        max_parallel_requests: int = 0,
     ) -> None:
         self.llm_name = llm_name
         self.llm_base_url = llm_base_url
         self.max_retries = max_retries
+        self.max_parallel_requests = max(0, int(max_parallel_requests or 0))
 
         os.makedirs(cache_dir, exist_ok=True)
         self.cache_file = os.path.join(cache_dir, f"llm_cache_{self.llm_name.replace('/', '_')}.sqlite")
@@ -209,6 +216,7 @@ class CacheOpenAICompat:
         self._client_lock = threading.Lock()
         self._client_index = 0
         self._client_pool: List[OpenAI] = []
+        self._request_sem: Optional[threading.BoundedSemaphore] = None
 
         if azure_endpoint:
             # AzureOpenAI api_version should be included in azure_endpoint query string (?api-version=...)
@@ -229,6 +237,9 @@ class CacheOpenAICompat:
                 for k in api_keys
             ]
             self.openai_client = self._client_pool[0]
+
+        if self.max_parallel_requests > 0:
+            self._request_sem = threading.BoundedSemaphore(self.max_parallel_requests)
 
     def _get_openai_client(self) -> OpenAI:
         if not self._client_pool:
@@ -258,7 +269,16 @@ class CacheOpenAICompat:
                 params["max_tokens"] = params.pop("max_completion_tokens")
 
         client = self._get_openai_client()
-        resp = client.chat.completions.create(**params)
+        waited_s = 0.0
+        if self._request_sem is not None:
+            t0 = time.perf_counter()
+            self._request_sem.acquire()
+            waited_s = float(time.perf_counter() - t0)
+        try:
+            resp = client.chat.completions.create(**params)
+        finally:
+            if self._request_sem is not None:
+                self._request_sem.release()
         content = resp.choices[0].message.content
         if not isinstance(content, str):
             content = str(content)
@@ -267,5 +287,6 @@ class CacheOpenAICompat:
             "prompt_tokens": getattr(resp.usage, "prompt_tokens", None),
             "completion_tokens": getattr(resp.usage, "completion_tokens", None),
             "finish_reason": resp.choices[0].finish_reason,
+            "waited_for_slot_s": round(waited_s, 4),
         }
         return content, meta

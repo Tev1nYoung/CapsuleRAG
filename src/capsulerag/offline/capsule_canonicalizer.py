@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Tuple
 import faiss
 import numpy as np
 
-from ..config import CapsuleBridgeConfig
+from ..config import CapsuleRAGConfig
 from ..utils.union_find import UnionFind
 
 
@@ -41,7 +41,7 @@ def _dedup_provenance(prov: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def canonicalize_capsules(
     capsules: List[Dict[str, Any]],
     capsule_embeddings: np.ndarray,
-    config: CapsuleBridgeConfig,
+    config: CapsuleRAGConfig,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, str], np.ndarray, List[str]]:
     """
     Returns:

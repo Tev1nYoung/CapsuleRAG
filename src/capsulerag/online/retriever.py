@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
-from ..config import CapsuleBridgeConfig
+from ..config import CapsuleRAGConfig
 from ..utils.logging_utils import get_logger
 from ..utils.text_utils import extract_entity_mentions, normalize_entity
 from ..utils.genericness_utils import title_genericness_score
@@ -76,6 +76,309 @@ def _parse_json_object(text: str) -> Dict[str, Any]:
             last_err = e
 
     raise last_err or ValueError("failed to parse JSON object")
+
+
+def _rank_docs_for_group(
+    gid: str,
+    group_doc_best_passage_sim: Dict[str, Dict[int, float]],
+    global_rank: Dict[int, int],
+    allowed_docs: Optional[Set[int]] = None,
+) -> List[int]:
+    sims = group_doc_best_passage_sim.get(str(gid)) or {}
+    ranked: List[Tuple[int, float]] = []
+    for d, s in sims.items():
+        didx = int(d)
+        if allowed_docs is not None and didx not in allowed_docs:
+            continue
+        ranked.append((didx, float(s)))
+    ranked.sort(key=lambda x: (-x[1], global_rank.get(x[0], 10**9)))
+    return [d for d, _ in ranked]
+
+
+def _coverage_reorder_docs(
+    base_rank: List[int],
+    node_ids: List[str],
+    group_doc_best_passage_sim: Dict[str, Dict[int, float]],
+    front_k: int,
+    ensure_top_docs: int,
+    coverage_top_n: int,
+    coverage_min_rel: float,
+) -> Tuple[List[int], List[int]]:
+    docs_rank = [int(d) for d in base_rank]
+    if front_k <= 0 or len(docs_rank) <= 1 or len(node_ids) <= 1:
+        return docs_rank, []
+
+    global_rank = {int(d): i for i, d in enumerate(docs_rank)}
+    front_k = min(front_k, len(docs_rank))
+    ensure_top_docs = max(0, min(ensure_top_docs, front_k, len(docs_rank)))
+    coverage_top_n = max(front_k, min(coverage_top_n, len(docs_rank)))
+    coverage_pool = set(docs_rank[:coverage_top_n])
+    coverage_groups = [str(gid) for gid in node_ids if str(gid) != "q0"]
+
+    front: List[int] = []
+    seen: Set[int] = set()
+
+    for d in docs_rank[:ensure_top_docs]:
+        if d not in seen:
+            front.append(int(d))
+            seen.add(int(d))
+
+    group_best: Dict[str, float] = {}
+    doc_group_rel: Dict[int, Dict[str, float]] = defaultdict(dict)
+    for gid in coverage_groups:
+        sims = group_doc_best_passage_sim.get(str(gid)) or {}
+        best = max((float(s) for d, s in sims.items() if int(d) in coverage_pool), default=-1e18)
+        if best <= -1e17:
+            continue
+        group_best[str(gid)] = float(best)
+        denom = max(abs(float(best)), 1e-8)
+        for d, s in sims.items():
+            didx = int(d)
+            if didx not in coverage_pool:
+                continue
+            rel = float(s) / denom
+            if rel >= coverage_min_rel:
+                doc_group_rel[didx][str(gid)] = float(rel)
+
+    uncovered = set(group_best.keys())
+    while uncovered and len(front) < front_k:
+        best_doc = None
+        best_key = None
+        for d in docs_rank[:coverage_top_n]:
+            didx = int(d)
+            if didx in seen:
+                continue
+            rels = doc_group_rel.get(didx) or {}
+            newly = [gid for gid in uncovered if gid in rels]
+            if not newly:
+                continue
+            cover_count = len(newly)
+            cover_score = sum(float(rels[gid]) for gid in newly)
+            key = (cover_count, cover_score, -global_rank.get(didx, 10**9))
+            if best_key is None or key > best_key:
+                best_key = key
+                best_doc = didx
+        if best_doc is None:
+            break
+        front.append(int(best_doc))
+        seen.add(int(best_doc))
+        for gid in list(uncovered):
+            if gid in (doc_group_rel.get(int(best_doc)) or {}):
+                uncovered.discard(gid)
+
+    for d in docs_rank[:coverage_top_n]:
+        if len(front) >= front_k:
+            break
+        didx = int(d)
+        if didx not in seen:
+            front.append(didx)
+            seen.add(didx)
+
+    reordered = list(front)
+    for d in docs_rank:
+        if int(d) not in seen:
+            reordered.append(int(d))
+    return reordered, front
+
+
+def _estimate_question_rerank_hops(question: str) -> int:
+    """
+    Estimate how many distinct retrieval hops the question likely needs.
+
+    We intentionally use a lightweight text heuristic here rather than the
+    query DAG alone, because the DAG can itself be under-decomposed on hard
+    Musique cases.
+    """
+    q = str(question or "").lower()
+    rel_hits = len(re.findall(r"\b(where|who|whose|which|that|when)\b", q))
+    temporal_hits = len(re.findall(r"\b(after|before|during|while)\b", q))
+    coord_hits = len(re.findall(r"\band\b", q))
+    wh_hits = len(re.findall(r"\b(what|which|who|when|where|how)\b", q))
+
+    target_nodes = 2 + min(rel_hits, 3)
+    if temporal_hits:
+        target_nodes += 1
+    if coord_hits >= 2:
+        target_nodes += 1
+    if wh_hits >= 3 and rel_hits >= 2:
+        target_nodes += 1
+
+    estimated_nodes = max(2, min(5, target_nodes))
+    return max(1, estimated_nodes - 1)
+
+
+def _choose_llm_rerank_budget(
+    question: str,
+    non_anchor_groups: int,
+    config: CapsuleRAGConfig,
+    rank_len: int,
+    qa_top_k_passages: int,
+    use_group_coverage: bool,
+) -> Tuple[int, int, Dict[str, Any]]:
+    base_top_n = max(3, int(getattr(config, "llm_doc_rerank_top_n", 10) or 10))
+    base_select_k = max(1, int(getattr(config, "llm_doc_rerank_select_k", 2) or 2))
+    snippet_chars = int(getattr(config, "llm_doc_rerank_snippet_chars", 320) or 320)
+
+    q_est_hops = _estimate_question_rerank_hops(question)
+    target_hops = max(int(non_anchor_groups or 0), int(q_est_hops))
+
+    top_n = min(base_top_n, max(3, int(rank_len)))
+    select_k = base_select_k
+
+    if bool(getattr(config, "enable_adaptive_llm_doc_rerank", True)) and target_hops >= 3:
+        max_select_k = int(getattr(config, "adaptive_llm_doc_rerank_max_select_k", 4) or 4)
+        max_select_k = max(base_select_k, max_select_k)
+        max_select_k = min(max_select_k, max(1, int(qa_top_k_passages or 5)), 5)
+        select_k = max(select_k, min(target_hops, max_select_k))
+
+        top_n_step = int(getattr(config, "adaptive_llm_doc_rerank_top_n_step", 2) or 2)
+        max_top_n = int(getattr(config, "adaptive_llm_doc_rerank_max_top_n", 16) or 16)
+        extra_slots = max(0, select_k - base_select_k)
+        if extra_slots > 0 and top_n_step > 0:
+            top_n = min(max_top_n, top_n + top_n_step * extra_slots)
+
+    if use_group_coverage:
+        select_k = max(select_k, min(max(1, non_anchor_groups), max(1, int(qa_top_k_passages or 5))))
+
+    top_n = max(3, min(top_n, int(rank_len)))
+    select_k = max(1, min(select_k, 5, top_n, max(1, int(qa_top_k_passages or 5))))
+    dbg = {
+        "base_top_n": base_top_n,
+        "base_select_k": base_select_k,
+        "final_top_n": top_n,
+        "final_select_k": select_k,
+        "snippet_chars": snippet_chars,
+        "estimated_question_hops": q_est_hops,
+        "non_anchor_groups": int(non_anchor_groups or 0),
+        "target_hops": target_hops,
+        "adaptive_enabled": bool(getattr(config, "enable_adaptive_llm_doc_rerank", True)),
+        "group_coverage_enabled": bool(use_group_coverage),
+    }
+    return top_n, select_k, dbg
+
+
+def _choose_qa_evidence_budget(
+    question: str,
+    non_anchor_groups: int,
+    config: CapsuleRAGConfig,
+) -> Tuple[int, int, int, Dict[str, Any]]:
+    base_limit = max(1, int(getattr(config, "qa_top_k_passages", 5) or 5))
+    base_ensure = max(0, int(getattr(config, "qa_ensure_top_docs", 0) or 0))
+    base_token_budget = max(1, int(getattr(config, "passage_token_budget", 1800) or 1800))
+
+    q_est_hops = _estimate_question_rerank_hops(question)
+    target_hops = max(int(non_anchor_groups or 0), int(q_est_hops))
+
+    final_limit = base_limit
+    final_ensure = base_ensure
+    final_token_budget = base_token_budget
+    extra_slots = 0
+
+    if bool(getattr(config, "enable_adaptive_qa_evidence", True)) and target_hops >= 3:
+        max_limit = max(base_limit, int(getattr(config, "adaptive_qa_top_k_passages_max", base_limit) or base_limit))
+        extra_slots = min(max(0, max_limit - base_limit), max(0, target_hops - 2))
+        final_limit = min(max_limit, base_limit + extra_slots)
+
+        ensure_max = max(base_ensure, int(getattr(config, "adaptive_qa_ensure_top_docs_max", base_ensure) or base_ensure))
+        if target_hops >= 4:
+            final_ensure = min(final_limit, ensure_max)
+
+        token_step = max(0, int(getattr(config, "adaptive_qa_token_budget_step", 250) or 250))
+        token_budget_max = max(
+            base_token_budget,
+            int(getattr(config, "adaptive_qa_token_budget_max", base_token_budget) or base_token_budget),
+        )
+        if extra_slots > 0 and token_step > 0:
+            final_token_budget = min(token_budget_max, base_token_budget + token_step * extra_slots)
+
+    dbg = {
+        "base_limit": base_limit,
+        "base_ensure_top_docs": base_ensure,
+        "base_token_budget": base_token_budget,
+        "estimated_question_hops": q_est_hops,
+        "non_anchor_groups": int(non_anchor_groups or 0),
+        "target_hops": target_hops,
+        "adaptive_enabled": bool(getattr(config, "enable_adaptive_qa_evidence", True)),
+        "extra_slots": extra_slots,
+        "final_limit": final_limit,
+        "final_ensure_top_docs": final_ensure,
+        "final_token_budget": final_token_budget,
+    }
+    return final_limit, final_ensure, final_token_budget, dbg
+
+
+def _build_group_seeded_rerank_candidates(
+    base_rank: List[int],
+    topo: List[str],
+    group_doc_best_passage_sim: Dict[str, Dict[int, float]],
+    top_n: int,
+    search_n: int,
+    docs_per_group: int,
+    min_rel: float,
+) -> Tuple[List[int], Dict[str, Any]]:
+    docs_rank = [int(d) for d in base_rank]
+    top_n = max(1, min(int(top_n), len(docs_rank)))
+    if top_n <= 1 or len(docs_rank) <= top_n:
+        return docs_rank[:top_n], {"strategy": "base_only", "group_seed_docs": {}}
+
+    global_rank = {int(d): i for i, d in enumerate(docs_rank)}
+    search_n = max(top_n, min(int(search_n), len(docs_rank)))
+    search_pool = set(docs_rank[:search_n])
+    docs_per_group = max(0, int(docs_per_group))
+    keep_prefix = max(2, min(top_n, 4))
+
+    seeded: List[int] = []
+    seen: Set[int] = set()
+    group_seed_docs: Dict[str, List[int]] = {}
+
+    for d in docs_rank[:keep_prefix]:
+        if d not in seen:
+            seeded.append(int(d))
+            seen.add(int(d))
+
+    if docs_per_group > 0:
+        for gid in topo:
+            gid = str(gid)
+            if gid == "q0" or len(seeded) >= top_n:
+                continue
+            sims = group_doc_best_passage_sim.get(gid) or {}
+            if not sims:
+                continue
+
+            best = max((float(s) for d, s in sims.items() if int(d) in search_pool), default=-1e18)
+            if best <= -1e17:
+                continue
+            denom = max(abs(float(best)), 1e-8)
+            picked = 0
+            for d in _rank_docs_for_group(gid, group_doc_best_passage_sim, global_rank, allowed_docs=search_pool):
+                if len(seeded) >= top_n or picked >= docs_per_group:
+                    break
+                rel = float((sims.get(int(d)) if int(d) in sims else sims.get(str(d), 0.0)) or 0.0) / denom
+                didx = int(d)
+                if rel < float(min_rel) or didx in seen:
+                    continue
+                seeded.append(didx)
+                seen.add(didx)
+                group_seed_docs.setdefault(gid, []).append(didx)
+                picked += 1
+
+    for d in docs_rank:
+        if len(seeded) >= top_n:
+            break
+        didx = int(d)
+        if didx not in seen:
+            seeded.append(didx)
+            seen.add(didx)
+
+    dbg = {
+        "strategy": "group_seeded" if group_seed_docs else "base_only",
+        "search_n": search_n,
+        "docs_per_group": docs_per_group,
+        "min_rel": float(min_rel),
+        "keep_prefix": keep_prefix,
+        "group_seed_docs": group_seed_docs,
+    }
+    return seeded[:top_n], dbg
 
 
 def _build_parent_map(query_dag: Dict[str, Any], node_ids: Set[str]) -> Dict[str, Set[str]]:
@@ -150,8 +453,8 @@ class RetrievalResult:
     debug: Dict[str, Any]
 
 
-class StructAlignRetriever:
-    def __init__(self, config: CapsuleBridgeConfig) -> None:
+class CapsuleRetriever:
+    def __init__(self, config: CapsuleRAGConfig) -> None:
         self.config = config
 
     def retrieve(
@@ -318,6 +621,8 @@ class StructAlignRetriever:
             group_seed_nodes[gid] = [x["node_id"] for x in cands[: self.config.seed_top_s]]
 
         node_ids = [str(g["group_id"]) for g in group_candidates]
+        non_anchor_groups = max(0, len(group_candidates) - 1)
+        use_group_coverage = bool(getattr(self.config, "enable_group_doc_coverage", True)) and non_anchor_groups >= 4
 
         # Multi-query dense doc ranks (question + subQs) and RRF fusion.
         group_dense_doc_rank: Dict[str, List[int]] = {}
@@ -401,7 +706,7 @@ class StructAlignRetriever:
                             g["candidates"] = sorted(g.get("candidates") or [], key=lambda x: float(x.get("prize") or 0.0), reverse=True)
                             group_prize_maps[gid] = pm
         except Exception as e:
-            logger.debug(f"[CapsuleBridgeRAG] [PPR] skipped | err={type(e).__name__}: {e}")
+            logger.debug(f"[CapsuleRAG] [PPR] skipped | err={type(e).__name__}: {e}")
 
         # DAG-aware binding assignment (zero-shot variable binding via entity overlap).
         parents = _build_parent_map(query_dag, set(node_ids))
@@ -543,7 +848,7 @@ class StructAlignRetriever:
                             continue
                         doc_score[didx] = float(doc_score.get(didx, 0.0)) + ppr_doc_w * float(rrf)
         except Exception as e:
-            logger.debug(f"[CapsuleBridgeRAG] [PPR] doc boost skipped | err={type(e).__name__}: {e}")
+            logger.debug(f"[CapsuleRAG] [PPR] doc boost skipped | err={type(e).__name__}: {e}")
 
         # Entity-jump: if an entity mentioned in high-prize capsules matches a doc title in the corpus,
         # boost that doc. This is a cheap zero-shot way to recover second-hop pages.
@@ -607,6 +912,12 @@ class StructAlignRetriever:
 
         # Lite-only: rank docs by fused score only (no diversification heuristic).
         struct_docs_rank = [doc for doc, _ in sorted(doc_score.items(), key=lambda x: x[1], reverse=True)]
+        rerank_dbg: Dict[str, Any] = {
+            "enabled": bool(llm is not None and bool(getattr(self.config, "enable_llm_doc_rerank", False))),
+            "applied": False,
+            "reason": "disabled_or_too_few_docs",
+            "selected_docs": [],
+        }
 
         # Optional: LLM rerank for top docs (targets Recall@2/5). Cheap because N is small and cached.
         if (
@@ -615,12 +926,34 @@ class StructAlignRetriever:
             and len(struct_docs_rank) >= 3
         ):
             try:
-                top_n = int(getattr(self.config, "llm_doc_rerank_top_n", 10))
-                select_k = int(getattr(self.config, "llm_doc_rerank_select_k", 2))
-                snippet_chars = int(getattr(self.config, "llm_doc_rerank_snippet_chars", 320))
-                top_n = max(3, min(top_n, len(struct_docs_rank)))
-                select_k = max(1, min(select_k, 5))
+                top_n, select_k, rerank_dbg = _choose_llm_rerank_budget(
+                    question=question,
+                    non_anchor_groups=non_anchor_groups,
+                    config=self.config,
+                    rank_len=len(struct_docs_rank),
+                    qa_top_k_passages=int(getattr(self.config, "qa_top_k_passages", 5) or 5),
+                    use_group_coverage=use_group_coverage,
+                )
+                rerank_dbg.update({"enabled": True, "applied": False, "reason": "llm_returned_no_valid_selection"})
+                snippet_chars = int(rerank_dbg.get("snippet_chars") or 320)
                 cand_docs = [int(d) for d in struct_docs_rank[:top_n]]
+                pool_dbg: Dict[str, Any] = {"strategy": "base_only", "group_seed_docs": {}}
+                if (
+                    bool(getattr(self.config, "enable_group_seeded_rerank_pool", True))
+                    and int(rerank_dbg.get("target_hops") or 0) >= 3
+                    and non_anchor_groups >= 3
+                ):
+                    cand_docs, pool_dbg = _build_group_seeded_rerank_candidates(
+                        base_rank=struct_docs_rank,
+                        topo=topo,
+                        group_doc_best_passage_sim=group_doc_best_passage_sim,
+                        top_n=top_n,
+                        search_n=int(getattr(self.config, "group_seeded_rerank_search_n", 60) or 60),
+                        docs_per_group=int(getattr(self.config, "group_seeded_rerank_docs_per_group", 1) or 1),
+                        min_rel=float(getattr(self.config, "group_seeded_rerank_min_rel", 0.85) or 0.85),
+                    )
+                rerank_dbg["candidate_pool"] = pool_dbg
+                rerank_dbg["candidate_docs"] = cand_docs
 
                 cand_lines: List[str] = []
                 for i, d in enumerate(cand_docs):
@@ -655,11 +988,18 @@ class StructAlignRetriever:
                     "Prefer candidates that cover different hops/entities. "
                     "Output strict JSON only."
                 )
+                coverage_hint = ""
+                if select_k >= 3:
+                    coverage_hint = (
+                        "This question appears to require multiple bridge steps. "
+                        "Prefer a diverse set that covers distinct hops/entities rather than redundant evidence "
+                        "about the same page.\n"
+                    )
                 user = (
                     f"Question:\n{question}\n\n"
                     "Candidates:\n"
                     + "\n".join(cand_lines)
-                    + f"\n\nReturn JSON: {{\"selected\": [i1, i2]}} with exactly {select_k} indices."
+                    + f"\n\n{coverage_hint}Return JSON: {{\"selected\": [i1, i2]}} with exactly {select_k} indices."
                 )
                 messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
                 try:
@@ -699,11 +1039,36 @@ class StructAlignRetriever:
 
                     rest = [int(d) for d in struct_docs_rank if int(d) not in seen]
                     struct_docs_rank = sel_docs + rest
+                    rerank_dbg["applied"] = True
+                    rerank_dbg["reason"] = "ok"
+                    rerank_dbg["selected_docs"] = sel_docs
+                    rerank_dbg["cache_hit"] = bool((meta or {}).get("cache_hit"))
                     logger.debug(
-                        f"[CapsuleBridgeRAG] [ONLINE_RERANK] applied | top_n={top_n} selected={sel_docs} cache_hit={bool((meta or {}).get('cache_hit'))}"
+                        f"[CapsuleRAG] [ONLINE_RERANK] applied | top_n={top_n} selected={sel_docs} cache_hit={bool((meta or {}).get('cache_hit'))}"
                     )
             except Exception as e:
-                logger.debug(f"[CapsuleBridgeRAG] [ONLINE_RERANK] skipped | err={type(e).__name__}: {e}")
+                rerank_dbg["reason"] = f"error:{type(e).__name__}"
+                logger.debug(f"[CapsuleRAG] [ONLINE_RERANK] skipped | err={type(e).__name__}: {e}")
+
+        qa_passage_limit, ensure_top_docs, qa_token_budget, qa_budget_dbg = _choose_qa_evidence_budget(
+            question=question,
+            non_anchor_groups=non_anchor_groups,
+            config=self.config,
+        )
+
+        coverage_front_docs: List[int] = []
+        if use_group_coverage:
+            coverage_top_n = int(getattr(self.config, "group_doc_coverage_top_n", 40) or 40)
+            coverage_min_rel = float(getattr(self.config, "group_doc_coverage_min_rel", 0.85) or 0.85)
+            struct_docs_rank, coverage_front_docs = _coverage_reorder_docs(
+                struct_docs_rank,
+                node_ids=node_ids,
+                group_doc_best_passage_sim=group_doc_best_passage_sim,
+                front_k=qa_passage_limit,
+                ensure_top_docs=ensure_top_docs,
+                coverage_top_n=coverage_top_n,
+                coverage_min_rel=coverage_min_rel,
+            )
 
         # Build retrieved_docs list: struct-selected first, then dense fill.
         retrieved_docs: List[str] = []
@@ -726,60 +1091,105 @@ class StructAlignRetriever:
         # Select passages for QA: per-doc best-passage strategy (lite_a).
         chosen_passages: List[Dict[str, Any]] = []
         chosen_pids: Set[str] = set()
+        chosen_doc_ids: Set[int] = set()
         total_tokens = 0
-        evidence_dbg: Dict[str, Any] = {"method": "per_doc_best"}
+        evidence_dbg: Dict[str, Any] = {
+            "method": "per_doc_best_group_coverage" if use_group_coverage else "per_doc_best",
+            "coverage_front_docs": coverage_front_docs,
+            "group_first_docs": {},
+            "qa_budget": qa_budget_dbg,
+        }
 
         struct_index = index.get("struct_index") or {}
         passage_to_cc = None
         if isinstance(struct_index, dict):
             passage_to_cc = struct_index.get("passage_to_canonical_capsules")
-        # Pick the best passage from each top-ranked doc (across the original question + subQs).
-        if not chosen_passages:
-            for d in struct_docs_rank:
-                if len(chosen_passages) >= self.config.qa_top_k_passages:
-                    break
-                d = int(d)
-                # Pick the best passage from this doc across *any* query variant (original question + subQs).
-                row = doc_best_passage_row.get(d)
-                best_sim = float(doc_best_passage_sim.get(d, -1e18))
+        coverage_top_n = max(qa_passage_limit, int(getattr(self.config, "group_doc_coverage_top_n", 40) or 40))
+        global_doc_rank = {int(d): i for i, d in enumerate(struct_docs_rank)}
+        coverage_search_docs = [int(d) for d in struct_docs_rank[: min(len(struct_docs_rank), coverage_top_n)]]
+        coverage_search_set = set(coverage_search_docs)
+
+        def add_doc_passage(didx: int, preferred_gid: Optional[str] = None) -> bool:
+            nonlocal total_tokens
+            didx = int(didx)
+            if didx in chosen_doc_ids:
+                return False
+
+            row = None
+            best_sim = float(doc_best_passage_sim.get(didx, -1e18))
+
+            if preferred_gid:
+                row_pref = (group_doc_best_passage_row.get(preferred_gid) or {}).get(didx)
+                sim_pref = (group_doc_best_passage_sim.get(preferred_gid) or {}).get(didx)
+                if row_pref is not None and sim_pref is not None:
+                    row = int(row_pref)
+                    best_sim = float(sim_pref)
+
+            if row is None:
+                row = doc_best_passage_row.get(didx)
                 for gid in node_ids:
-                    row_g = (group_doc_best_passage_row.get(gid) or {}).get(d)
-                    sim_g = (group_doc_best_passage_sim.get(gid) or {}).get(d)
+                    row_g = (group_doc_best_passage_row.get(gid) or {}).get(didx)
+                    sim_g = (group_doc_best_passage_sim.get(gid) or {}).get(didx)
                     if row_g is None or sim_g is None:
                         continue
                     if float(sim_g) > best_sim:
                         best_sim = float(sim_g)
                         row = int(row_g)
 
-                if row is None:
-                    continue
-                p = passages[int(row)]
-                pid = str(p.get("passage_id") or "")
-                if not pid or pid in chosen_pids:
-                    continue
-                toks = int(p.get("token_count") or _approx_tokens(p.get("text", "")))
-                if total_tokens + toks > self.config.passage_token_budget:
-                    continue
-                chosen_passages.append(p)
-                chosen_pids.add(pid)
-                total_tokens += toks
+            if row is None:
+                return False
 
-            # Final fallback: dense top passages for the original question.
-            if not chosen_passages:
-                top_p_rows = _safe_topk(p_sims, min(self.config.qa_top_k_passages * 50, len(passages))).tolist()
-                for row in top_p_rows:
-                    if len(chosen_passages) >= self.config.qa_top_k_passages:
+            p = passages[int(row)]
+            pid = str(p.get("passage_id") or "")
+            if not pid or pid in chosen_pids:
+                return False
+            toks = int(p.get("token_count") or _approx_tokens(p.get("text", "")))
+            if total_tokens + toks > qa_token_budget:
+                return False
+
+            chosen_passages.append(p)
+            chosen_pids.add(pid)
+            chosen_doc_ids.add(didx)
+            total_tokens += toks
+            return True
+
+        # Keep the strongest docs, then spend the remaining evidence budget on uncovered query groups.
+        for d in struct_docs_rank[:ensure_top_docs]:
+            if len(chosen_passages) >= qa_passage_limit:
+                break
+            add_doc_passage(int(d))
+
+        if use_group_coverage:
+            for gid in topo:
+                if str(gid) == "q0":
+                    continue
+                if len(chosen_passages) >= qa_passage_limit:
+                    break
+                for d in _rank_docs_for_group(gid, group_doc_best_passage_sim, global_doc_rank, allowed_docs=coverage_search_set):
+                    if add_doc_passage(int(d), preferred_gid=gid):
+                        evidence_dbg["group_first_docs"][str(gid)] = int(d)
                         break
-                    p = passages[int(row)]
-                    pid = str(p.get("passage_id") or "")
-                    if not pid or pid in chosen_pids:
-                        continue
-                    toks = int(p.get("token_count") or _approx_tokens(p.get("text", "")))
-                    if total_tokens + toks > self.config.passage_token_budget:
-                        continue
-                    chosen_passages.append(p)
-                    chosen_pids.add(pid)
-                    total_tokens += toks
+
+        for d in struct_docs_rank:
+            if len(chosen_passages) >= qa_passage_limit:
+                break
+            add_doc_passage(int(d))
+
+        # Dense fallback should fill remaining evidence slots, not just the all-empty case.
+        top_p_rows = _safe_topk(p_sims, min(qa_passage_limit * 50, len(passages))).tolist()
+        for row in top_p_rows:
+            if len(chosen_passages) >= qa_passage_limit:
+                break
+            p = passages[int(row)]
+            pid = str(p.get("passage_id") or "")
+            if not pid or pid in chosen_pids:
+                continue
+            toks = int(p.get("token_count") or _approx_tokens(p.get("text", "")))
+            if total_tokens + toks > qa_token_budget:
+                continue
+            chosen_passages.append(p)
+            chosen_pids.add(pid)
+            total_tokens += toks
 
         # SubQCoverage@M: compute coverage of top-M capsules per group inside the final evidence passages.
         subq_top_m = max(1, int(getattr(self.config, "subq_coverage_top_m", 5) or 5))
@@ -825,6 +1235,7 @@ class StructAlignRetriever:
             "binding_topo": topo,
             "binding_parents": {k: sorted(list(v)) for k, v in parents.items()},
             "binding_assignment": chosen,
+            "llm_doc_rerank": rerank_dbg,
         }
 
         if ppr_out and bool(ppr_out.get("enabled")):
