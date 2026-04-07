@@ -73,7 +73,7 @@ def main() -> None:
         "--llm_max_parallel_requests",
         type=int,
         default=None,
-        help="Optional cap on concurrent uncached LLM requests. Helps avoid rate limits / malformed outputs.",
+        help="Optional online-only cap on concurrent uncached LLM requests. Helps avoid rate limits / malformed outputs.",
     )
 
     # Optional quick checks

@@ -20,7 +20,7 @@ class CapsuleRAGConfig:
     llm_base_url: str = DEFAULT_LLM_BASE_URL
     llm_name: str = DEFAULT_LLM_NAME
     embedding_model_name: str = DEFAULT_EMB_NAME
-    llm_max_parallel_requests: int = 2  # cap concurrent uncached LLM calls to reduce 429/format failures
+    llm_max_parallel_requests: int = 2  # online-only cap for uncached LLM calls to reduce 429/format failures
     llm_max_retries: int = 6
 
     # Embedding runtime

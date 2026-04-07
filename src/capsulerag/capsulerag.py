@@ -127,7 +127,17 @@ class CapsuleRAG:
             os.environ["OPENAI_API_KEY"] = "sk-"
 
         cache_dir = os.path.join(self.non_reusable_dir, "llm_cache")
-        self.llm = CacheOpenAICompat(
+        self.offline_llm = CacheOpenAICompat(
+            cache_dir=cache_dir,
+            llm_name=config.llm_name,
+            llm_base_url=config.llm_base_url,
+            temperature=config.temperature,
+            max_new_tokens=config.max_new_tokens,
+            seed=config.seed,
+            max_retries=int(getattr(config, "llm_max_retries", 6) or 6),
+            max_parallel_requests=0,
+        )
+        self.online_llm = CacheOpenAICompat(
             cache_dir=cache_dir,
             llm_name=config.llm_name,
             llm_base_url=config.llm_base_url,
@@ -137,14 +147,18 @@ class CapsuleRAG:
             max_retries=int(getattr(config, "llm_max_retries", 6) or 6),
             max_parallel_requests=int(getattr(config, "llm_max_parallel_requests", 0) or 0),
         )
+        self.llm = self.online_llm
         logger.info(
-            f"[CapsuleRAG] llm runtime | keys={getattr(self.llm, 'num_keys')()} max_parallel_requests={int(getattr(config, 'llm_max_parallel_requests', 0) or 0)}"
+            "[CapsuleRAG] llm runtime | "
+            f"keys={getattr(self.online_llm, 'num_keys')()} "
+            "offline_max_parallel_requests=0 "
+            f"online_max_parallel_requests={int(getattr(config, 'llm_max_parallel_requests', 0) or 0)}"
         )
 
         # Pipeline parts
         self.indexer = OfflineIndexer(config=config, meta_dir=self.reusable_dir)
         self.retriever = CapsuleRetriever(config=config)
-        self.generator = AnswerGenerator(config=config, llm=self.llm)
+        self.generator = AnswerGenerator(config=config, llm=self.online_llm)
 
         # Outputs
         self.metrics_log_path = os.path.join(self.metrics_dir, "metrics_log.jsonl")
@@ -238,7 +252,7 @@ class CapsuleRAG:
             pass
 
     def index(self, corpus: List[Dict[str, Any]]) -> Dict[str, Any]:
-        return self.indexer.build_or_load(corpus=corpus, embedder=self.embedder, llm=self.llm)
+        return self.indexer.build_or_load(corpus=corpus, embedder=self.embedder, llm=self.offline_llm)
 
     def rag_qa(
         self,
@@ -270,7 +284,7 @@ class CapsuleRAG:
         if workers <= 0:
             # Conservative auto: use up to num_keys, but cap to 8 to avoid 429 storms on some providers.
             try:
-                workers = min(8, max(1, int(getattr(self.llm, "num_keys")() or 1)))
+                workers = min(8, max(1, int(getattr(self.online_llm, "num_keys")() or 1)))
             except Exception:
                 workers = 1
 
@@ -280,8 +294,14 @@ class CapsuleRAG:
             qt0 = time.time()
             logger.info(f"[CapsuleRAG] [Step 1-5] query start | qid={qid} | {q}")
 
-            dag = build_query_dag(q, llm=self.llm, config=self.config)
-            rr = self.retriever.retrieve(question=q, query_dag=dag, index=index, embedder=self.embedder, llm=self.llm)
+            dag = build_query_dag(q, llm=self.online_llm, config=self.config)
+            rr = self.retriever.retrieve(
+                question=q,
+                query_dag=dag,
+                index=index,
+                embedder=self.embedder,
+                llm=self.online_llm,
+            )
             ans, gen_meta = self.generator.answer(question=q, passages=rr.selected_passages, query_dag=dag)
 
             return {
@@ -467,7 +487,7 @@ class CapsuleRAG:
         workers = int(getattr(self.config, "online_qa_workers", 0) or 0)
         if workers <= 0:
             try:
-                workers = min(8, max(1, int(getattr(self.llm, "num_keys")() or 1)))
+                workers = min(8, max(1, int(getattr(self.online_llm, "num_keys")() or 1)))
             except Exception:
                 workers = 1
 
@@ -477,8 +497,14 @@ class CapsuleRAG:
             qt0 = time.time()
             logger.info(f"[CapsuleRAG] [Step 1-4] query start | qid={qid} | {q}")
 
-            dag = build_query_dag(q, llm=self.llm, config=self.config)
-            rr = self.retriever.retrieve(question=q, query_dag=dag, index=index, embedder=self.embedder, llm=self.llm)
+            dag = build_query_dag(q, llm=self.online_llm, config=self.config)
+            rr = self.retriever.retrieve(
+                question=q,
+                query_dag=dag,
+                index=index,
+                embedder=self.embedder,
+                llm=self.online_llm,
+            )
 
             return {
                 "i": i,
